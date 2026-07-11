@@ -1,0 +1,121 @@
+//@version=6
+// Copyright (c) 2026 Gurjit Singh
+// This source code is subject to the terms of the Mozilla Public License 2.0 at https://mozilla.org/MPL/2.0/
+indicator("Cycle Adaptive Relative Strength", "CARS", overlay=false)
+
+// Functions
+// --- Hilbert FIR transform helper
+f_hilbert(series float src, series float bw) =>
+    (0.0962 * nz(src) +
+        0.5769 * nz(src[2]) -
+        0.5769 * nz(src[4]) -
+        0.0962 * nz(src[6])) * bw
+
+ht_dcperiod(series float source) =>
+    // --- Persistent state (IIR variables only) ---
+    var float inPhase2     = 0.0
+    var float quad2        = 0.0
+    var float realPart     = 0.0
+    var float imagPart     = 0.0
+    var float period       = 0.0
+    var float smoothPeriod = 0.0
+
+    // --- Price smoothing (WMA-4) ---
+    float price = nz(source)
+    float smoothed = (4.0 * price +
+                        3.0 * nz(price[1]) +
+                        2.0 * nz(price[2]) +
+                        nz(price[3])) / 10.0
+
+    // --- Adaptive bandwidth ---
+    float bw = 0.075 * period + 0.54
+
+    // --- Hilbert transforms ---
+    float detrender = f_hilbert(smoothed, bw)
+    float quad1     = f_hilbert(detrender, bw)
+    float inPhase1  = nz(detrender[3])
+
+    // --- Advance phase ---
+    float jitterI = f_hilbert(inPhase1, bw)
+    float jitterQ = f_hilbert(quad1, bw)
+
+    // --- Smoothed Phasor Recombination ---
+    inPhase2 := 0.2 * (inPhase1 - jitterQ) + 0.8 * nz(inPhase2[1])
+    quad2    := 0.2 * (quad1 + jitterI)    + 0.8 * nz(quad2[1])
+
+    // --- Homodyne discriminator ---
+    float ip2Prev = nz(inPhase2[1])
+    float q2Prev  = nz(quad2[1])
+
+    realPart := 0.2 * (inPhase2 * ip2Prev + quad2 * q2Prev) + 0.8 * nz(realPart[1])
+    imagPart := 0.2 * (inPhase2 * q2Prev  - quad2 * ip2Prev) + 0.8 * nz(imagPart[1])
+
+    // --- Dominant Cycle Period Computation ---
+    float prevPeriod = period
+
+    if math.abs(imagPart) > 1e-12 and math.abs(realPart) > 1e-12
+        float angle = math.atan(imagPart / realPart)
+        if math.abs(angle) > 1e-12
+            period := 2.0 * math.pi / angle
+
+    // --- Rate limiting & Clamping ---
+    if prevPeriod > 0
+        period := math.min(math.max(period, 0.67 * prevPeriod), 1.5 * prevPeriod)
+
+    period := math.min(math.max(period, 6.0), 50.0)
+
+    // --- Output smoothing ---
+    period := 0.2 * period + 0.8 * prevPeriod
+    smoothPeriod := 0.33 * period + 0.67 * nz(smoothPeriod[1])
+    smoothPeriod
+
+superSmoother3(src, length) =>
+    // length := math.max(1, length)
+    omega = math.pi * math.sqrt(3.0) / length
+    alpha = math.exp(-math.pi / length)
+    beta = 2.0 * alpha * math.cos(omega)
+    gamma = math.pow(alpha, 2)
+    coef2 = beta + gamma
+    coef3 = -(gamma + (beta * gamma))
+    coef4 = math.pow(gamma, 2)
+    coef1 = 1.0 - coef2 - coef3 - coef4
+    filt = src
+    if bar_index > 3
+        filt := (coef1 * nz(src, src[1])) +
+             (coef2 * nz(filt[1])) +
+             (coef3 * nz(filt[2])) +
+             (coef4 * nz(filt[3]))
+    filt
+
+clamp(val, lo, hi) =>
+    math.max(lo, math.min(hi, val))
+
+// Inputs
+src       = input.source(close, "Source")
+minPeriod = input.int(8, "Min Dominant Cycle", minval=5)
+maxPeriod = input.int(48, "Max Dominant Cycle", minval=10)
+cycleMult = input.float(1.0,  "Cycle Multiplier", 0.5, step = 0.5)
+
+upColor   = input.color(color.rgb(176, 190, 197), "Up")
+downColor = input.color(color.rgb(141, 110, 99), "Down")
+
+// Dominant Cycle
+dc_raw = ht_dcperiod(src)
+dcLen = clamp(dc_raw * cycleMult, minPeriod, maxPeriod)
+
+// Relative Strength with SSF Averaging
+change = nz(src - src[1])
+gain   = math.max(change, 0.0)
+loss   = math.max(-change, 0.0)
+
+avgGain = superSmoother3(gain, dcLen)
+avgLoss = superSmoother3(loss, dcLen)
+
+cars = avgGain + avgLoss != 0 ? (avgGain - avgLoss) / (avgGain + avgLoss) : 0.0
+
+// Output
+//────────────────────────────────────────────────────────────
+plotColor = cars > 0 ? upColor : downColor // ta.rising(cars, 1)
+
+plot(cars, "CARS", color=plotColor, linewidth=2)
+hline(0, "Zero Line", color=color.gray)
